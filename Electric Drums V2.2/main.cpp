@@ -3,80 +3,89 @@
 #include <mcp3004.h>
 #include <vector>
 #include <algorithm>
+#include <cmath>
+#include <chrono>
 #include <wiringSerial.h>
-#include <lo/lo.h>
-#include <lo/lo_cpp.h>
 
 #define BASE 100
 #define SPI_CHAN 0
-#define SERIAL_DEVICE "/dev/ttyAMA0"
 
-std::vector<int> thresholds = { 100, 100, 100, 100, 100 };
-std::vector<int> maxThresholds = { 1023, 1023, 1023, 1023, 1023 };
+std::vector<int> thresholds = { 50, 50, 50, 50, 50 };
+std::vector<int> maxThresholds = { 900, 900, 900, 900, 900 };
 std::vector<int> last_values(5, 0);
 std::vector<bool> was_increasing(5, false);
 std::vector<int> peak_values(5, 0);
-const double peak_drop_percent = 0.4; // 40%
+std::vector<float> hp_filter_buffer(5, 0);
+std::vector<float> lp_filter_buffer(5, 0);
+std::vector<std::chrono::steady_clock::time_point> last_increase_time(5);
+const double peak_drop_percent = 0.6; // 40%
+const double highpass_coeff = 0.99; // highpass filter coefficient
+const double lowpass_coeff = 0.05; // lowpass filter coefficient
+const std::chrono::milliseconds peak_hold_time(2);
+double sensitivity = 1; // Adjust this to change sensitivity
 
 double envelope_alpha = 0.1;
 double min_alpha = 0.1;
 double max_alpha = 0.9;
 
-int fd; // Global variable for the file descriptor
-
-// Create an OSC target
-const char* targetIP = "127.0.0.1";
-int targetPort = 8000;
-lo::Address target(targetIP, targetPort, LO_UDP);
-
-void sendMidiMessage(int command, int channel, int data1, int data2) {
+void printMidiMessage(int command, int channel, int data1, int data2) {
     int status = command | channel;
-    serialPutchar(fd, status);
-    serialPutchar(fd, data1);
-    serialPutchar(fd, data2);
+    std::cout << "Status: " << status << ", Data1: " << data1 << ", Data2: " << data2 << std::endl;
 }
 
-void sendNoteOn(int channel, int note, int velocity) {
-    sendMidiMessage(0x90, channel, note, velocity);
-
-    // Send OSC message
-    lo::Message message("/noteOn");
-    message.add(channel);
-    message.add(note);
-    message.add(velocity);
-    target.send(message);
+void printNoteOn(int channel, int note, int velocity) {
+    printMidiMessage(0x90, channel, note, velocity);
 }
 
-void sendNoteOff(int channel, int note) {
-    sendMidiMessage(0x80, channel, note, 0);
-
-    // Send OSC message
-    lo::Message message("/noteOff");
-    message.add(channel);
-    message.add(note);
-    target.send(message);
+void printNoteOff(int channel, int note) {
+    printMidiMessage(0x80, channel, note, 0);
 }
 
 void setup() {
     if (wiringPiSetup() == -1)
         exit(1);
     mcp3004Setup(BASE, SPI_CHAN);
-
-    // Open the serial port.
-    fd = serialOpen(SERIAL_DEVICE, 115200);
-    if (fd < 0) {
-        std::cerr << "Failed to open serial port " << SERIAL_DEVICE << std::endl;
-        exit(1);
-    }
 }
 
 void loop() {
+    for (int channel = 0; channel < 5; ++channel) {
+        // Rest of your existing code...
+
+        if (value > thresholds[channel] && value < maxThresholds[channel]) {
+            // Rest of your existing code...
+
+        else if (was_increasing[channel] && value < peak_values[channel] - peak_values[channel] * peak_drop_percent) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_increase_time[channel]) > peak_hold_time) {
+                was_increasing[channel] = false;
+
+                int note_number = (channel == 0) ? 38 : (channel == 3) ? 43 : 41;
+                int adjusted_velocity = std::min(127, std::max(0, (int)(peak_values[channel] * 127 * sensitivity / 1023)));
+
+                printNoteOn(channel, note_number, adjusted_velocity);
+                delay(25);
+                printNoteOff(channel, note_number);
+            }
+        }
+        }
     for (int channel = 0; channel < 5; ++channel) {
         if (channel == 1 || channel == 2 || channel == 4 || channel == 5 || channel == 6) {
             continue;
         }
 
         int raw_value = analogRead(BASE + channel);
+
+        // Apply high-pass filter on channel 0
+        if (channel == 0) {
+            raw_value -= hp_filter_buffer[channel] * highpass_coeff;
+            hp_filter_buffer[channel] = raw_value;
+        }
+        // Apply low-pass filter on other channels
+        else if (channel == 3 || channel == 5) {
+            raw_value = raw_value * lowpass_coeff + lp_filter_buffer[channel] * (1.0 - lowpass_coeff);
+            lp_filter_buffer[channel] = raw_value;
+        }
+
         int envelope = envelope_alpha * raw_value + (1.0 - envelope_alpha) * last_values[channel];
         double alpha = min_alpha + (max_alpha - min_alpha) * ((double)envelope / maxThresholds[channel]);
         double filtered_value = alpha * raw_value + (1.0 - alpha) * last_values[channel];
@@ -86,16 +95,20 @@ void loop() {
             if (value > last_values[channel] && value > peak_values[channel] * (1 - peak_drop_percent)) {
                 peak_values[channel] = value;
                 was_increasing[channel] = true;
+                last_increase_time[channel] = std::chrono::steady_clock::now();
             }
             else if (was_increasing[channel] && value < peak_values[channel] - peak_values[channel] * peak_drop_percent) {
-                std::cout << "Peak for CH" << channel << ": " << peak_values[channel] << "\n";
-                was_increasing[channel] = false;
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_increase_time[channel]) > peak_hold_time) {
+                    was_increasing[channel] = false;
 
-                int note_number = (channel == 0) ? 38 : (channel == 3) ? 43 : 41;
+                    int note_number = (channel == 0) ? 38 : (channel == 3) ? 43 : 41;
+                    int adjusted_velocity = std::min(127, std::max(0, (int)(peak_values[channel] * 127 * sensitivity / 1023)));
 
-                sendNoteOn(channel, note_number, 127);
-                delay(500); // Some delay might be required between note-on and note-off
-                sendNoteOff(channel, note_number);
+                    printNoteOn(channel, note_number, adjusted_velocity);
+                    delay(25);
+                    printNoteOff(channel, note_number);
+                }
             }
         }
 
